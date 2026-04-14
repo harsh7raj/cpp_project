@@ -96,18 +96,6 @@ pause_for_read 3
 # ══════════════════════════════════════════════════════════════════════════════
 divider "STEP 1 of 6 — Current State (Before Failure)"
 
-explain "Right now, the HA cluster is healthy:
-  • ${ACTIVE_POD} is the ACTIVE leader — it holds the Kubernetes Lease
-  • ${ACTIVE_POD}'s sidecar renews the Lease every 5 seconds
-  • ${STANDBY_POD} is the HOT STANDBY — its sidecar checks the Lease
-    every 2 seconds, but sees it's still held by ${ACTIVE_POD}
-  • The Service 'jenkins' routes traffic ONLY to the active pod
-    (it uses selector: jenkins-role=active)"
-
-subdiv "Pod Status"
-kubectl -n "$NS" get pods -l app=jenkins -L jenkins-role -o wide
-echo ""
-
 ACTIVE_POD=$(kubectl -n "$NS" get pod -l app=jenkins,jenkins-role=active \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 STANDBY_POD=$(kubectl -n "$NS" get pod -l app=jenkins,jenkins-role=standby \
@@ -120,6 +108,18 @@ if [ -z "$ACTIVE_POD" ]; then
   fail "No active pod found. Wait for the system to stabilize."
   exit 1
 fi
+
+explain "Right now, the HA cluster is healthy:
+  • ${ACTIVE_POD} is the ACTIVE leader — it holds the Kubernetes Lease
+  • ${ACTIVE_POD}'s sidecar renews the Lease every 5 seconds
+  • ${STANDBY_POD} is the HOT STANDBY — its sidecar checks the Lease
+    every 2 seconds, but sees it's still held by ${ACTIVE_POD}
+  • The Service 'jenkins' routes traffic ONLY to the active pod
+    (it uses selector: jenkins-role=active)"
+
+subdiv "Pod Status"
+kubectl -n "$NS" get pods -l app=jenkins -L jenkins-role -o wide
+echo ""
 
 echo -e "  ${BG_GREEN}${BOLD} ACTIVE  ${NC}  ${BOLD}${ACTIVE_POD}${NC}  ← Jenkins is running here, serving traffic"
 echo -e "  ${BG_YELLOW}${BOLD} STANDBY ${NC}  ${BOLD}${STANDBY_POD}${NC}  ← Jenkins NOT running, waiting for promotion"
