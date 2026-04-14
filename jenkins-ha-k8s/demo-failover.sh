@@ -11,6 +11,7 @@ set -uo pipefail
 
 NS="jenkins"
 LEASE="jenkins-leader"
+LEASE_DURATION=15
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -96,10 +97,10 @@ pause_for_read 3
 divider "STEP 1 of 6 — Current State (Before Failure)"
 
 explain "Right now, the HA cluster is healthy:
-  • jenkins-0 is the ACTIVE leader — it holds the Kubernetes Lease
-  • jenkins-0's sidecar renews the Lease every 5 seconds
-  • jenkins-1 is the HOT STANDBY — its sidecar checks the Lease
-    every 2 seconds, but sees it's still held by jenkins-0
+  • ${ACTIVE_POD} is the ACTIVE leader — it holds the Kubernetes Lease
+  • ${ACTIVE_POD}'s sidecar renews the Lease every 5 seconds
+  • ${STANDBY_POD} is the HOT STANDBY — its sidecar checks the Lease
+    every 2 seconds, but sees it's still held by ${ACTIVE_POD}
   • The Service 'jenkins' routes traffic ONLY to the active pod
     (it uses selector: jenkins-role=active)"
 
@@ -111,6 +112,9 @@ ACTIVE_POD=$(kubectl -n "$NS" get pod -l app=jenkins,jenkins-role=active \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
 STANDBY_POD=$(kubectl -n "$NS" get pod -l app=jenkins,jenkins-role=standby \
   -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+# Capture the full identity (name/uid) of the current holder for failover detection
+ORIGINAL_HOLDER=$(kubectl -n "$NS" get lease "$LEASE" \
+  -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
 
 if [ -z "$ACTIVE_POD" ]; then
   fail "No active pod found. Wait for the system to stabilize."
@@ -202,48 +206,35 @@ explain "We will now FORCE-DELETE ${ACTIVE_POD} to simulate a sudden crash.
 What this means:
   • ${ACTIVE_POD} is immediately terminated — no graceful shutdown
   • ${ACTIVE_POD}'s sidecar STOPS renewing the Lease
-  • We then promote ${STANDBY_POD} by updating the Lease object
-  • ${STANDBY_POD}'s sidecar will see it is now the holder
-  • ${STANDBY_POD} becomes ACTIVE and starts Jenkins
+  • The Lease still names ${ACTIVE_POD} as holder, but renewals stop
+  • After ${LEASE_DURATION}s of no renewal the Lease is considered stale
+  • ${STANDBY_POD}'s sidecar detects the expired Lease and acquires it
 
-Meanwhile, Kubernetes StatefulSet controller will recreate
-${ACTIVE_POD}, but it will come back as STANDBY because
-${STANDBY_POD} already holds the Lease."
+The StatefulSet will recreate ${ACTIVE_POD} with a NEW pod UID.
+The new pod's sidecar sees holderIdentity != its own identity (UID
+changed) so it will NOT reclaim the lease — it waits to be elected.
+This is real, automatic failover with no manual intervention."
 
 echo -e "  ${BG_RED}${BOLD}                                                    ${NC}"
 echo -e "  ${BG_RED}${BOLD}   >>> CRASHING ${ACTIVE_POD} NOW <<<               ${NC}"
 echo -e "  ${BG_RED}${BOLD}                                                    ${NC}"
 echo ""
 
-# Step A: Force-delete the active pod (synchronous — wait for deletion)
+# Force-delete the active pod — nothing else, no manual lease changes
 log "Force-deleting ${ACTIVE_POD} (--grace-period=0 --force)..."
 kubectl -n "$NS" delete pod "$ACTIVE_POD" --grace-period=0 --force 2>&1 || true
-ok "${ACTIVE_POD} delete command sent"
+ok "${ACTIVE_POD} deleted — sidecar is gone, Lease renewals have stopped"
+KILL_TIME=$(date +%s)
 echo ""
-
-# Step B: Wait a few seconds to ensure the old sidecar is truly dead
-log "Waiting 5 seconds for old sidecar to fully terminate..."
-sleep 5
-ok "Old sidecar should be dead now"
-echo ""
-
-# Step C: Transfer leadership to the standby pod via Lease update
-NOW_ISO=$(date -u '+%Y-%m-%dT%H:%M:%S.000000Z')
-log "Updating Lease: holderIdentity → ${STANDBY_POD} (promoting standby)"
-kubectl -n "$NS" patch lease "$LEASE" --type=merge \
-  -p "{\"spec\":{\"holderIdentity\":\"${STANDBY_POD}\",\"renewTime\":\"${NOW_ISO}\",\"acquireTime\":\"${NOW_ISO}\"}}" 2>/dev/null || true
-ok "Lease transferred to ${STANDBY_POD}"
 
 explain "Right now:
-  • ${ACTIVE_POD} is DEAD — force-deleted from the cluster
-  • The Lease now says: holderIdentity = ${STANDBY_POD}
-  • ${STANDBY_POD}'s sidecar will see it is the holder on next check
-  • ${STANDBY_POD}'s sidecar will label itself: jenkins-role=active
-  • ${STANDBY_POD}'s guard script will see role=active and START Jenkins
-  • K8s StatefulSet will recreate ${ACTIVE_POD} in the background
-  • New ${ACTIVE_POD} will come back as STANDBY since Lease is held by ${STANDBY_POD}"
-
-KILL_TIME=$(date +%s)
+  • ${ACTIVE_POD} is DEAD — its sidecar has stopped renewing the Lease
+  • The Lease still says holderIdentity = ${ACTIVE_POD}/<old-uid>
+  • ${STANDBY_POD}'s sidecar is polling every 2s, waiting for expiry
+  • After ${LEASE_DURATION}s of silence the Lease is stale — ${STANDBY_POD} will acquire it
+  • StatefulSet recreates ${ACTIVE_POD} with a NEW UID — its sidecar
+    sees a different identity in the Lease, so it will NOT reclaim it
+  • Whoever acquires the Lease first (after expiry) becomes the new leader"
 
 pause_for_read 2
 
@@ -254,16 +245,17 @@ divider "STEP 4 of 6 — 👀 WATCHING FAILOVER IN REAL TIME"
 
 explain "What should happen now — watch it live below:
 
-  +0s   ${ACTIVE_POD} is GONE. Lease points to ${STANDBY_POD}.
-  +2s   ${STANDBY_POD}'s sidecar sees: I am now the holder!
-  +2s   ${STANDBY_POD}'s sidecar labels itself: jenkins-role=active
-  +2s   K8s Service shifts traffic to ${STANDBY_POD}
-  +4s   ${STANDBY_POD}'s guard script sees role=active
-  +4s   ${STANDBY_POD}'s guard script STARTS Jenkins
- +10s   K8s recreates ${ACTIVE_POD} via StatefulSet controller
- +15s   ${ACTIVE_POD} comes back as STANDBY — Lease held by ${STANDBY_POD}
+   +0s  ${ACTIVE_POD} deleted. Its sidecar stops renewing the Lease.
+   +2s  ${STANDBY_POD}'s sidecar polls — Lease still held by ${ACTIVE_POD}, not yet stale.
+   ~5s  StatefulSet recreates ${ACTIVE_POD} with a NEW UID — it cannot reclaim the Lease.
+  +15s  Lease age exceeds ${LEASE_DURATION}s without renewal — it is now STALE.
+  +15s  ${STANDBY_POD}'s sidecar detects expiry, races to acquire the Lease.
+  +15s  ${STANDBY_POD} patches holderIdentity → its own identity, becomes ACTIVE.
+  +17s  ${STANDBY_POD}'s guard script detects role=active, STARTS Jenkins.
+  +17s  K8s Service selector shifts traffic to ${STANDBY_POD}.
 
-  Key: Lease duration = 15s, Renew interval = 5s, Check interval = 2s"
+  Key: Lease duration = ${LEASE_DURATION}s, Renew interval = 5s, Check interval = 2s
+  No manual intervention — pure automatic failover via lease expiry."
 
 log "Monitoring for standby promotion..."
 echo ""
@@ -273,7 +265,7 @@ echo ""
 FAILOVER_DETECTED=false
 FAILOVER_TIME=0
 
-for i in $(seq 1 30); do
+for i in $(seq 1 25); do
   ELAPSED=$(( $(date +%s) - KILL_TIME ))
 
   # Check if the former standby is now active
@@ -288,20 +280,21 @@ for i in $(seq 1 30); do
   POD_STATUS=$(kubectl -n "$NS" get pods -l app=jenkins -L jenkins-role \
     --no-headers 2>/dev/null || echo "checking...")
 
+  # The holder identity is now "podname/uid" — extract just the name for display
+  DISPLAY_HOLDER="${HOLDER%%/*}"
+
   # Phase description
   PHASE=""
   if [ -z "$HOLDER" ] || [ "$HOLDER" = "null" ]; then
-    PHASE="${YELLOW}⏳ Lease VACANT — waiting for a pod to claim it${NC}"
-  elif [ "$HOLDER" = "$STANDBY_POD" ]; then
-    PHASE="${GREEN}🏆 ${STANDBY_POD} holds the Lease!${NC}"
-  elif [ "$HOLDER" = "$ACTIVE_POD" ]; then
-    PHASE="${YELLOW}⏳ Stale holder in Lease — will expire${NC}"
+    PHASE="${YELLOW}⏳ Lease VACANT — pods racing to acquire${NC}"
+  elif [ "$HOLDER" = "$ORIGINAL_HOLDER" ]; then
+    PHASE="${YELLOW}⏳ Old holder (dead) — Lease expires in ~${LEASE_DURATION}s from last renewal${NC}"
   else
-    PHASE="${CYAN}? holder=${HOLDER}${NC}"
+    PHASE="${GREEN}🏆 NEW holder: ${DISPLAY_HOLDER} — failover complete!${NC}"
   fi
 
   echo -e "${CYAN}  ┌── [+${ELAPSED}s] ──────────${NC}"
-  echo -e "${CYAN}  │${NC} Lease holder: ${BOLD}${HOLDER:-<VACANT>}${NC}  ${PHASE}"
+  echo -e "${CYAN}  │${NC} Lease holder: ${BOLD}${DISPLAY_HOLDER:-<VACANT>}${NC}  ${PHASE}"
   echo "$POD_STATUS" | while read -r line; do
     if echo "$line" | grep -q "active"; then
       echo -e "${CYAN}  │${NC}   ${GREEN}▶ $line${NC}"
@@ -313,7 +306,8 @@ for i in $(seq 1 30); do
   done
   echo -e "${CYAN}  └──────────────────────${NC}"
 
-  if [ -n "$NEW_ACTIVE" ] && [ "$NEW_ACTIVE" != "$ACTIVE_POD" ]; then
+  # Failover is complete when the Lease has a NEW identity AND a pod has the active label
+  if [ -n "$HOLDER" ] && [ "$HOLDER" != "$ORIGINAL_HOLDER" ] && [ -n "$NEW_ACTIVE" ]; then
     FAILOVER_TIME=$ELAPSED
     FAILOVER_DETECTED=true
     echo ""
@@ -325,14 +319,14 @@ for i in $(seq 1 30); do
 
     explain "What just happened:
   1. ${ACTIVE_POD} crashed — its sidecar STOPPED renewing the Lease
-  2. The Lease was updated: holderIdentity set to ${STANDBY_POD}
-  3. ${STANDBY_POD}'s sidecar detected it is the holder
+  2. The Lease went stale after ${LEASE_DURATION}s of no renewal
+  3. ${STANDBY_POD}'s sidecar detected expiry and acquired the Lease
   4. ${STANDBY_POD}'s sidecar labeled itself: jenkins-role=active
-  5. K8s Service selector jenkins-role=active now matches ${NEW_ACTIVE}
-  6. All traffic is now routed to ${NEW_ACTIVE}
-  7. ${NEW_ACTIVE}'s guard script saw role=active and STARTED Jenkins!
-  8. Meanwhile, K8s StatefulSet controller is recreating ${ACTIVE_POD}
-  9. ${ACTIVE_POD} will come back, see Lease is held, become STANDBY"
+  5. K8s Service selector shifted — all traffic now routes to ${NEW_ACTIVE}
+  6. ${NEW_ACTIVE}'s guard script saw role=active and STARTED Jenkins!
+  7. K8s StatefulSet recreated ${ACTIVE_POD} with a NEW UID
+  8. New ${ACTIVE_POD} saw a different identity in the Lease — became STANDBY
+  No manual intervention. Pure automatic failover."
     break
   fi
 
@@ -341,7 +335,7 @@ for i in $(seq 1 30); do
 done
 
 if [ "$FAILOVER_DETECTED" = false ]; then
-  fail "Failover did not complete within 60 seconds. Check sidecar logs."
+  fail "Failover did not complete within 50 seconds. Check sidecar logs."
   echo ""
   echo "Debug commands:"
   echo "  kubectl -n $NS logs ${STANDBY_POD} -c leader-elector --tail=30"
@@ -367,14 +361,15 @@ explain "The failover is complete. Here is the system state:
 
 What happened internally:
   1. ${ACTIVE_POD} crashed — its sidecar STOPPED renewing the Lease
-  2. The Lease was transferred to ${STANDBY_POD}
-  3. ${STANDBY_POD}'s sidecar saw itself as holder and became ACTIVE
+  2. The Lease went stale after ${LEASE_DURATION}s of no renewal
+  3. ${STANDBY_POD}'s sidecar detected expiry and acquired the Lease
   4. ${STANDBY_POD}'s sidecar labeled itself: jenkins-role=active
   5. K8s Service selector shifted traffic to ${NEW_ACTIVE}
   6. ${NEW_ACTIVE}'s guard script detected role=active, STARTED Jenkins
-  7. K8s StatefulSet controller noticed ${ACTIVE_POD} missing, recreating
-  8. ${ACTIVE_POD} will come back, but ${NEW_ACTIVE} holds the Lease
-     so ${ACTIVE_POD} stays standby"
+  7. K8s StatefulSet recreated ${ACTIVE_POD} with a brand-new UID
+  8. New ${ACTIVE_POD}'s sidecar saw a foreign identity in the Lease
+     so it became STANDBY — cluster is healthy again
+  No manual intervention at any point."
 
 subdiv "Single-Leader Invariant Check"
 log "Verifying only ONE pod is active (no split-brain)..."
@@ -492,7 +487,7 @@ echo ""
 echo -e "  ${BOLD}  Test 2: Failover Speed${NC}"
 if [ "$FAILOVER_TIME" -le 30 ]; then
   echo -e "     ${GREEN}✅ PASS${NC} — Failover completed in ${BOLD}${FAILOVER_TIME}s${NC} (target: ≤30s)"
-  echo -e "     ${DIM}Sidecar check interval=2s, Lease duration=15s${NC}"
+  echo -e "     ${DIM}Includes 5s sidecar teardown + lease transfer + standby detection${NC}"
 else
   echo -e "     ${YELLOW}⚠  SLOW${NC} — Failover took ${FAILOVER_TIME}s (target: ≤30s)"
 fi

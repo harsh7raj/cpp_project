@@ -9,9 +9,12 @@ data:
   leader-elector.sh: |
     #!/usr/bin/env bash
     # leader-elector.sh — Lease-based leader election for Jenkins HA.
+    # Identity = POD_NAME/POD_UID so a restarted pod with the same name
+    # but a new UID will never mistake an old lease for its own.
     set -euo pipefail
 
     POD_NAME="${POD_NAME:?POD_NAME must be set}"
+    POD_UID="${POD_UID:?POD_UID must be set}"
     POD_NAMESPACE="${POD_NAMESPACE:?POD_NAMESPACE must be set}"
     LEASE_NAME="${LEASE_NAME:-jenkins-leader}"
     LEASE_DURATION="${LEASE_DURATION:-15}"
@@ -19,6 +22,8 @@ data:
     RETRY_INTERVAL="${RETRY_INTERVAL:-2}"
     ROLE_FILE="${ROLE_FILE:-/var/run/jenkins-ha/role}"
     MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
+
+    IDENTITY="${POD_NAME}/${POD_UID}"
 
     consecutive_failures=0
     current_role="standby"
@@ -72,7 +77,7 @@ data:
       local now_iso
       now_iso="$(date -u '+%Y-%m-%dT%H:%M:%S.000000Z')"
       kubectl patch lease "$LEASE_NAME" -n "$POD_NAMESPACE" --type=merge \
-        -p "{\"spec\":{\"holderIdentity\":\"${POD_NAME}\",\"leaseDurationSeconds\":${LEASE_DURATION},\"acquireTime\":\"${now_iso}\",\"renewTime\":\"${now_iso}\"}}" \
+        -p "{\"spec\":{\"holderIdentity\":\"${IDENTITY}\",\"leaseDurationSeconds\":${LEASE_DURATION},\"acquireTime\":\"${now_iso}\",\"renewTime\":\"${now_iso}\"}}" \
         2>/dev/null
     }
 
@@ -88,7 +93,7 @@ data:
       local holder
       holder="$(kubectl get lease "$LEASE_NAME" -n "$POD_NAMESPACE" \
         -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)"
-      [ "$holder" = "$POD_NAME" ]
+      [ "$holder" = "$IDENTITY" ]
     }
 
     clear_lease() {
@@ -105,7 +110,7 @@ data:
     become_active() {
       write_role "active"
       label_pod "active"
-      log "I am the leader."
+      log "I am the leader. identity=$IDENTITY"
     }
 
     self_fence() {
@@ -124,14 +129,13 @@ data:
 
     trap cleanup SIGTERM SIGINT EXIT
 
-    log "Starting leader elector for pod=$POD_NAME, namespace=$POD_NAMESPACE, lease=$LEASE_NAME"
+    log "Starting leader elector: pod=$POD_NAME uid=$POD_UID identity=$IDENTITY"
     log "Settings: duration=${LEASE_DURATION}s, renew=${RENEW_INTERVAL}s, retry=${RETRY_INTERVAL}s"
 
     mkdir -p "$(dirname "$ROLE_FILE")"
     write_role "standby"
     label_pod "standby"
     create_lease_if_missing
-    HAVE_ACQUIRED=false
 
     while true; do
       lease_data="$(get_lease)" || {
@@ -147,25 +151,8 @@ data:
       consecutive_failures=0
       IFS='|' read -r holder renew_time acquire_time <<< "$lease_data"
 
-      # Am I already the holder?
-      if [ "$holder" = "$POD_NAME" ]; then
-        # On first run, verify the lease isn't stale from a previous pod with our name
-        if [ "$HAVE_ACQUIRED" = "false" ]; then
-          if [ -n "$renew_time" ]; then
-            renew_epoch="$(parse_time "$renew_time")"
-            now_epoch="$(epoch_seconds)"
-            age=$((now_epoch - renew_epoch))
-            if [ "$age" -gt "$LEASE_DURATION" ]; then
-              log "Stale lease detected on startup (age=${age}s). Clearing and re-electing..."
-              clear_lease
-              become_standby
-              sleep "$RETRY_INTERVAL"
-              continue
-            fi
-          fi
-          HAVE_ACQUIRED=true
-          log "Resuming as holder (lease is fresh)."
-        fi
+      # Am I the current holder (exact instance match via UID)?
+      if [ "$holder" = "$IDENTITY" ]; then
         if renew_lease; then
           if [ "$current_role" != "active" ]; then
             become_active
@@ -206,7 +193,6 @@ data:
         if try_acquire; then
           sleep 0.5
           if verify_holder; then
-            HAVE_ACQUIRED=true
             become_active
             sleep "$RENEW_INTERVAL"
             continue
@@ -219,7 +205,7 @@ data:
         fi
       else
         if [ "$current_role" != "standby" ]; then
-          log "Another pod ($holder) holds the lease. Becoming standby."
+          log "Another instance ($holder) holds the lease. Becoming standby."
           become_standby
         fi
       fi
