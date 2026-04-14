@@ -1,0 +1,20 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-ha-role
+  namespace: jenkins
+  labels:
+    app: jenkins
+rules:
+  # Leader election: read, create, update the Lease
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch", "list", "watch"]
+  # Label own pod for Service selector routing
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]
+  # Emit events for observability
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]

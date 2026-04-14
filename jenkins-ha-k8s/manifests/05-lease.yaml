@@ -1,0 +1,11 @@
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: jenkins-leader
+  namespace: jenkins
+  labels:
+    app: jenkins
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  leaseDurationSeconds: 15

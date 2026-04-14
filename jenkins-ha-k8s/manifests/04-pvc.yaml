@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jenkins-ha-home
+  namespace: jenkins
+  labels:
+    app: jenkins
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
+  # ──────────────────────────────────────────────────────────────────────
+  # IMPORTANT: Set this to your cluster's RWX-capable StorageClass.
+  # Common values: nfs-client, efs-sc, azurefile, cephfs, local-path (dev only)
+  # For local dev with kind/minikube, see README for NFS setup.
+  # ──────────────────────────────────────────────────────────────────────
+  # storageClassName: nfs-client

@@ -1,0 +1,175 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: jenkins
+  namespace: jenkins
+  labels:
+    app: jenkins
+spec:
+  serviceName: jenkins-headless
+  replicas: 2
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      app: jenkins
+  template:
+    metadata:
+      labels:
+        app: jenkins
+        # jenkins-role will be set dynamically by the sidecar (active/standby)
+    spec:
+      serviceAccountName: jenkins-ha-sa
+      terminationGracePeriodSeconds: 60
+
+      # Prefer spreading pods across different nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - jenkins
+                topologyKey: kubernetes.io/hostname
+
+      # Run Jenkins containers as UID 1000 (jenkins user)
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      # Shared volumes
+      volumes:
+        # Shared Jenkins home (RWX PVC)
+        - name: jenkins-home
+          persistentVolumeClaim:
+            claimName: jenkins-ha-home
+        # Inter-container signaling (role file)
+        - name: ha-signal
+          emptyDir: {}
+        # Shell scripts from ConfigMap
+        - name: scripts
+          configMap:
+            name: jenkins-ha-scripts
+            defaultMode: 0755
+
+      # Fix ownership of jenkins-home before containers start
+      initContainers:
+        - name: fix-permissions
+          image: busybox:latest
+          command: ["sh", "-c", "chown -R 1000:1000 /var/jenkins_home"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+
+      containers:
+        # ── Container 1: Jenkins ──────────────────────────────────────────
+        - name: jenkins
+          image: jenkins/jenkins:lts
+          # Override entrypoint to use our guard script
+          command: ["/bin/bash", "/scripts/jenkins-guard.sh"]
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: agent
+              containerPort: 50000
+              protocol: TCP
+
+          env:
+            - name: ROLE_FILE
+              value: /var/run/jenkins-ha/role
+            - name: JAVA_OPTS
+              value: >-
+                -Xmx512m
+                -Xms256m
+                -Djava.awt.headless=true
+                -Djenkins.install.runSetupWizard=false
+
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+            - name: ha-signal
+              mountPath: /var/run/jenkins-ha
+            - name: scripts
+              mountPath: /scripts
+
+          # Role-aware probes
+          livenessProbe:
+            exec:
+              command: ["/bin/bash", "/scripts/liveness.sh"]
+            initialDelaySeconds: 120
+            periodSeconds: 10
+            timeoutSeconds: 6
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["/bin/bash", "/scripts/readiness.sh"]
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            timeoutSeconds: 6
+            failureThreshold: 3
+
+          # Graceful shutdown: flip role to standby before SIGTERM
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - /bin/bash
+                  - -c
+                  - |
+                    echo "standby" > /var/run/jenkins-ha/role
+                    sleep 5
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+
+        # ── Container 2: Leader Elector Sidecar ──────────────────────────
+        - name: leader-elector
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "/scripts/leader-elector.sh"]
+
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEASE_NAME
+              value: jenkins-leader
+            - name: LEASE_DURATION
+              value: "15"
+            - name: RENEW_INTERVAL
+              value: "5"
+            - name: RETRY_INTERVAL
+              value: "2"
+            - name: ROLE_FILE
+              value: /var/run/jenkins-ha/role
+
+          volumeMounts:
+            - name: ha-signal
+              mountPath: /var/run/jenkins-ha
+            - name: scripts
+              mountPath: /scripts
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
