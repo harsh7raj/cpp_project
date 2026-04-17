@@ -1,0 +1,122 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Jenkins HA Helm chart values
+# ─────────────────────────────────────────────────────────────────────────────
+# Defaults reproduce the hand-written manifests exactly. Override any value
+# with `--set` or a custom values file for your environment.
+# ─────────────────────────────────────────────────────────────────────────────
+
+nameOverride: ""
+fullnameOverride: "jenkins"
+
+replicaCount: 2
+
+image:
+  jenkins:
+    repository: jenkins/jenkins
+    tag: lts
+    pullPolicy: IfNotPresent
+  sidecar:
+    repository: bitnami/kubectl
+    tag: latest
+    pullPolicy: IfNotPresent
+  init:
+    repository: busybox
+    tag: latest
+    pullPolicy: IfNotPresent
+
+# ─── Private Registry ────────────────────────────────────────────────────────
+# Set enabled=true to pull the three container images from a private registry.
+# Two modes:
+#   (A) Let Helm generate a Secret from creds you supply here (username/password).
+#   (B) Reference an existing Secret in the namespace via existingSecret.
+imagePullSecret:
+  enabled: false
+  # Name of the Secret Helm creates (mode A).
+  name: jenkins-registry-creds
+  # Registry host, e.g. registry.hpe.example.com or index.docker.io.
+  registry: ""
+  username: ""
+  password: ""
+  email: ""
+  # If set, use a pre-existing Secret instead of creating one (mode B).
+  existingSecret: ""
+
+# ─── Storage ─────────────────────────────────────────────────────────────────
+persistence:
+  enabled: true
+  name: jenkins-ha-home
+  accessModes:
+    - ReadWriteMany
+  size: 20Gi
+  # Leave empty to use the cluster default, or set to nfs-client / efs-sc etc.
+  storageClassName: ""
+  # Keep the PVC on `helm uninstall` so Jenkins data survives reinstalls.
+  keepOnUninstall: true
+
+# ─── Leader Election ─────────────────────────────────────────────────────────
+leaderElection:
+  leaseName: jenkins-leader
+  leaseDurationSeconds: 15
+  renewIntervalSeconds: 5
+  retryIntervalSeconds: 2
+  # Keep the Lease across `helm uninstall` so quorum survives reinstalls.
+  keepOnUninstall: true
+
+# ─── StatefulSet tuning ──────────────────────────────────────────────────────
+statefulset:
+  terminationGracePeriodSeconds: 60
+  podManagementPolicy: OrderedReady
+  podAntiAffinity:
+    enabled: true
+    topologyKey: kubernetes.io/hostname
+    weight: 100
+
+securityContext:
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+jenkins:
+  javaOpts: "-Xmx512m -Xms256m -Djava.awt.headless=true -Djenkins.install.runSetupWizard=false"
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  livenessProbe:
+    initialDelaySeconds: 120
+    periodSeconds: 10
+    timeoutSeconds: 6
+    failureThreshold: 5
+  readinessProbe:
+    initialDelaySeconds: 30
+    periodSeconds: 5
+    timeoutSeconds: 6
+    failureThreshold: 3
+
+sidecar:
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# ─── Service ─────────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+  httpPort: 8080
+  agentPort: 50000
+
+# ─── RBAC ────────────────────────────────────────────────────────────────────
+serviceAccount:
+  create: true
+  name: jenkins-ha-sa
+
+rbac:
+  create: true
+  roleName: jenkins-ha-role
+  roleBindingName: jenkins-ha-rolebinding

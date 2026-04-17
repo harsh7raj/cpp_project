@@ -1,28 +1,86 @@
 # Makefile — Jenkins HA on Kubernetes
+# Helm is the canonical install path. All targets either delegate to Helm
+# or read state directly from the cluster.
+#
 # Usage:
-#   make deploy                     # Deploy with default StorageClass
-#   make deploy SC=nfs-client       # Deploy with a specific StorageClass
+#   make install                    # Deploy (default StorageClass)
+#   make install SC=nfs-client      # Deploy with a specific StorageClass
+#   make install IPS_REGISTRY=registry.hpe.example.com \
+#                IPS_USER=ciuser IPS_PASS=xxxx     # ...and a private registry
+#   make upgrade                    # Re-render and apply chart/values changes
+#   make uninstall                  # Remove the Helm release (PVC + Lease kept)
+#   make teardown-all               # Full wipe — PVC, Lease, namespace
+#   make template                   # Render chart to stdout (debug)
+#   make lint                       # Lint the chart
 #   make status                     # Show current state
-#   make failover-test              # Run the failover demo
-#   make logs                       # Tail sidecar logs
+#   make failover-test              # Run the failover demo (criteria 1-3)
+#   make upgrade-test               # Run the Helm upgrade demo (criterion 4)
+#   make ui-demo                    # Guided browser demo (run in 2nd terminal)
+#   make ui-port-forward            # Auto-reconnecting port-forward for browser
+#   make logs / logs-jenkins        # Tail sidecar / Jenkins logs
 #   make port-forward               # Open Jenkins UI on localhost:8080
-#   make teardown                   # Remove everything (keep PVC)
-#   make teardown-all               # Remove everything including PVC
 
 NS       := jenkins
 SC       ?=
+RELEASE  := jenkins-ha
+CHART    := helm/jenkins-ha
 
-.PHONY: deploy status failover-test logs port-forward teardown teardown-all \
+.PHONY: install upgrade uninstall teardown-all template lint \
+        status failover-test upgrade-test ui-demo ui-port-forward \
+        logs logs-jenkins port-forward \
         watch-pods watch-lease
 
-# ── Deploy ────────────────────────────────────────────────────────────────────
-deploy:
-	@chmod +x deploy.sh demo-failover.sh teardown.sh
-	@if [ -n "$(SC)" ]; then \
-		./deploy.sh "$(SC)"; \
-	else \
-		./deploy.sh; \
-	fi
+# ── Helm args (shared by install/upgrade/template) ────────────────────────────
+# Pass SC=<class> to pin storageClassName, or leave empty for cluster default.
+# Use IPS_* vars to enable private-registry image pulls.
+IPS_REGISTRY ?=
+IPS_USER     ?=
+IPS_PASS     ?=
+IPS_EMAIL    ?=
+IPS_EXISTING ?=
+
+HELM_ARGS  = --namespace $(NS) --create-namespace
+ifneq ($(strip $(SC)),)
+HELM_ARGS += --set persistence.storageClassName=$(SC)
+endif
+ifneq ($(strip $(IPS_EXISTING)),)
+HELM_ARGS += --set imagePullSecret.enabled=true --set imagePullSecret.existingSecret=$(IPS_EXISTING)
+else ifneq ($(strip $(IPS_REGISTRY)),)
+HELM_ARGS += --set imagePullSecret.enabled=true \
+             --set imagePullSecret.registry=$(IPS_REGISTRY) \
+             --set imagePullSecret.username=$(IPS_USER) \
+             --set imagePullSecret.password=$(IPS_PASS)
+ifneq ($(strip $(IPS_EMAIL)),)
+HELM_ARGS += --set imagePullSecret.email=$(IPS_EMAIL)
+endif
+endif
+
+# ── Install / upgrade / uninstall ─────────────────────────────────────────────
+install:
+	helm upgrade --install $(RELEASE) $(CHART) $(HELM_ARGS)
+
+upgrade: install
+
+uninstall:
+	helm uninstall $(RELEASE) --namespace $(NS) || true
+	@echo ""
+	@echo "Note: PVC ('jenkins-ha-home') and Lease ('jenkins-leader') are retained"
+	@echo "      via helm.sh/resource-policy: keep, so Jenkins data survives."
+	@echo "      Run 'make teardown-all' for a full wipe (PVC + namespace)."
+
+teardown-all:
+	helm uninstall $(RELEASE) --namespace $(NS) || true
+	kubectl -n $(NS) delete pvc jenkins-ha-home --ignore-not-found=true
+	kubectl -n $(NS) delete lease jenkins-leader --ignore-not-found=true
+	kubectl delete namespace $(NS) --ignore-not-found=true
+	@echo ""
+	@echo "✓ Full teardown complete."
+
+template:
+	helm template $(RELEASE) $(CHART) $(HELM_ARGS)
+
+lint:
+	helm lint $(CHART)
 
 # ── Status ────────────────────────────────────────────────────────────────────
 status:
@@ -42,6 +100,27 @@ status:
 failover-test:
 	@chmod +x demo-failover.sh
 	@./demo-failover.sh
+
+# ── Helm Upgrade Demo (4th success criterion) ─────────────────────────────────
+upgrade-test:
+	@chmod +x helm-upgrade-demo.sh
+	@./helm-upgrade-demo.sh
+
+# ── UI / Browser Demo ─────────────────────────────────────────────────────────
+# Auto-reconnecting port-forward — survives pod restarts during a live failover.
+# Use this instead of `make port-forward` when demonstrating in a browser.
+ui-port-forward:
+	@echo "Auto-reconnecting port-forward → http://localhost:8080"
+	@echo "(Press Ctrl+C to stop — reconnects automatically on pod changes)"
+	@while true; do \
+	  kubectl -n $(NS) port-forward svc/jenkins 8080:8080 2>/dev/null || true; \
+	  echo ""; echo "  ⚠ port-forward dropped (pod restart?) — reconnecting in 2s..."; \
+	  sleep 2; \
+	done
+
+ui-demo:
+	@chmod +x ui-demo.sh
+	@./ui-demo.sh
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
 logs:
@@ -72,12 +151,3 @@ port-forward:
 	@echo "Opening Jenkins on http://localhost:8080 ..."
 	@echo "(Press Ctrl+C to stop)"
 	kubectl -n $(NS) port-forward svc/jenkins 8080:8080
-
-# ── Teardown ──────────────────────────────────────────────────────────────────
-teardown:
-	@chmod +x teardown.sh
-	@./teardown.sh
-
-teardown-all:
-	@chmod +x teardown.sh
-	@./teardown.sh --delete-pvc

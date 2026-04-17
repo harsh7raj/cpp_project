@@ -84,7 +84,7 @@ log "Pre-flight checks..."
 
 if ! kubectl -n "$NS" get statefulset jenkins &>/dev/null; then
   fail "StatefulSet 'jenkins' not found in namespace '$NS'."
-  echo "  Run ./deploy.sh first."
+  echo "  Run 'make install' first."
   exit 1
 fi
 ok "StatefulSet found"
@@ -360,15 +360,13 @@ explain "The failover is complete. Here is the system state:
   ${STANDBY_POD} = STANDBY        ${NEW_ACTIVE} = ACTIVE ← NEW LEADER!
 
 What happened internally:
-  1. ${ACTIVE_POD} crashed — its sidecar STOPPED renewing the Lease
+  1. ${ACTIVE_POD} (old instance, UID: ${ORIGINAL_HOLDER##*/}) crashed
   2. The Lease went stale after ${LEASE_DURATION}s of no renewal
-  3. ${STANDBY_POD}'s sidecar detected expiry and acquired the Lease
-  4. ${STANDBY_POD}'s sidecar labeled itself: jenkins-role=active
+  3. The first pod to detect expiry acquired the Lease: ${NEW_ACTIVE}
+  4. ${NEW_ACTIVE}'s sidecar labeled itself: jenkins-role=active
   5. K8s Service selector shifted traffic to ${NEW_ACTIVE}
   6. ${NEW_ACTIVE}'s guard script detected role=active, STARTED Jenkins
-  7. K8s StatefulSet recreated ${ACTIVE_POD} with a brand-new UID
-  8. New ${ACTIVE_POD}'s sidecar saw a foreign identity in the Lease
-     so it became STANDBY — cluster is healthy again
+  7. All other pods saw the Lease held by a new identity — became STANDBY
   No manual intervention at any point."
 
 subdiv "Single-Leader Invariant Check"
@@ -487,7 +485,7 @@ echo ""
 echo -e "  ${BOLD}  Test 2: Failover Speed${NC}"
 if [ "$FAILOVER_TIME" -le 30 ]; then
   echo -e "     ${GREEN}✅ PASS${NC} — Failover completed in ${BOLD}${FAILOVER_TIME}s${NC} (target: ≤30s)"
-  echo -e "     ${DIM}Includes 5s sidecar teardown + lease transfer + standby detection${NC}"
+  echo -e "     ${DIM}Lease expiry (15s) + election race + label propagation${NC}"
 else
   echo -e "     ${YELLOW}⚠  SLOW${NC} — Failover took ${FAILOVER_TIME}s (target: ≤30s)"
 fi
@@ -504,9 +502,9 @@ fi
 echo ""
 echo -e "  ${BOLD}├─────────────────────────────────────────────────────────────┤${NC}"
 printf "  ${BOLD}│  %-57s│${NC}\n" "Failover Path:"
-printf "  ${BOLD}│    %-55s│${NC}\n" "${ACTIVE_POD} (active) → CRASHED"
-printf "  ${BOLD}│    %-55s│${NC}\n" "${NEW_ACTIVE:-$STANDBY_POD} (standby → active) ← NEW LEADER"
-printf "  ${BOLD}│    %-55s│${NC}\n" "${ACTIVE_POD} → recreated as STANDBY"
+printf "  ${BOLD}│    %-55s│${NC}\n" "${ACTIVE_POD} (old instance) → CRASHED (UID: ${ORIGINAL_HOLDER##*/})"
+printf "  ${BOLD}│    %-55s│${NC}\n" "${NEW_ACTIVE} (new leader) ← WON ELECTION"
+printf "  ${BOLD}│    %-55s│${NC}\n" "Cluster restored: 1 active + 1 standby"
 echo -e "  ${BOLD}└─────────────────────────────────────────────────────────────┘${NC}"
 echo ""
 
@@ -530,7 +528,9 @@ for i in $(seq 1 20); do
     echo ""
     kubectl -n "$NS" get pods -l app=jenkins -L jenkins-role -o wide
     echo ""
-    echo -e "  ${DIM}Notice: ${NEW_ACTIVE:-$STANDBY_POD} is ACTIVE (new leader), ${ACTIVE_POD} is ${OLD_ROLE} (rejoined)${NC}"
+    FINAL_STANDBY=$(kubectl -n "$NS" get pod -l app=jenkins,jenkins-role=standby \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "unknown")
+    echo -e "  ${DIM}Notice: ${NEW_ACTIVE} is ACTIVE (new leader), ${FINAL_STANDBY} is STANDBY (ready for next failover)${NC}"
     echo ""
     break
   fi

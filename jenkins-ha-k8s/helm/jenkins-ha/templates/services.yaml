@@ -1,0 +1,44 @@
+# Main Service: routes traffic ONLY to the active pod via label selector
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "jenkins-ha.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: jenkins
+    jenkins-role: active
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: {{ .Values.service.httpPort }}
+      protocol: TCP
+    - name: agent
+      port: {{ .Values.service.agentPort }}
+      targetPort: {{ .Values.service.agentPort }}
+      protocol: TCP
+---
+# Headless Service: required by StatefulSet for stable DNS names.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jenkins-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "jenkins-ha.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: jenkins
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: {{ .Values.service.httpPort }}
+      protocol: TCP
+    - name: agent
+      port: {{ .Values.service.agentPort }}
+      targetPort: {{ .Values.service.agentPort }}
+      protocol: TCP

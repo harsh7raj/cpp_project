@@ -1,0 +1,28 @@
+Jenkins HA has been installed into namespace: {{ .Release.Namespace }}
+
+Release:   {{ .Release.Name }}
+Chart:     {{ .Chart.Name }}-{{ .Chart.Version }}
+Replicas:  {{ .Values.replicaCount }}
+
+── What to watch ───────────────────────────────────────────────────────────
+  kubectl -n {{ .Release.Namespace }} get pods -l app=jenkins -L jenkins-role -w
+  kubectl -n {{ .Release.Namespace }} get lease {{ .Values.leaderElection.leaseName }} -o yaml
+
+── Open the Jenkins UI ─────────────────────────────────────────────────────
+  kubectl -n {{ .Release.Namespace }} port-forward svc/jenkins {{ .Values.service.httpPort }}:{{ .Values.service.httpPort }}
+  # then browse http://localhost:{{ .Values.service.httpPort }}
+
+── Failover test ───────────────────────────────────────────────────────────
+  kubectl -n {{ .Release.Namespace }} delete pod $(kubectl -n {{ .Release.Namespace }} \
+    get pod -l app=jenkins,jenkins-role=active -o jsonpath='{.items[0].metadata.name}') --grace-period=0 --force
+
+{{- if .Values.imagePullSecret.enabled }}
+
+── Private registry ────────────────────────────────────────────────────────
+  Images pulled via Secret: {{ include "jenkins-ha.pullSecretName" . }}
+{{- if .Values.imagePullSecret.existingSecret }}
+  Mode: referencing existing Secret
+{{- else }}
+  Mode: Secret generated from chart values (registry={{ .Values.imagePullSecret.registry }})
+{{- end }}
+{{- end }}

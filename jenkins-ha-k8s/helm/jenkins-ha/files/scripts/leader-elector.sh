@@ -23,6 +23,18 @@ MAX_API_FAILURES="${MAX_API_FAILURES:-3}"
 # Unique identity for this specific pod instance — survives name reuse
 IDENTITY="${POD_NAME}/${POD_UID}"
 
+# Priority-based acquisition delay — higher ordinal wins elections.
+# When the lease expires and multiple pods race to acquire it, the pod with
+# the higher ordinal (e.g. jenkins-1) tries immediately; lower ordinals
+# (e.g. jenkins-0) wait before trying, by which time the higher-ordinal
+# pod has already acquired and verified. This ensures the standby pod
+# consistently wins when the active pod crashes and is recreated.
+# At initial startup this has no effect: jenkins-0 starts alone (OrderedReady
+# policy means jenkins-1 does not start until jenkins-0 is Ready).
+POD_ORDINAL="${POD_NAME##*-}"
+ACQUISITION_DELAY=$(( (1 - POD_ORDINAL) * 4 ))
+if [ "$ACQUISITION_DELAY" -lt 0 ]; then ACQUISITION_DELAY=0; fi
+
 # ── State ────────────────────────────────────────────────────────────────────
 consecutive_failures=0
 current_role="standby"
@@ -121,11 +133,15 @@ self_fence() {
 }
 
 # ── Graceful exit ────────────────────────────────────────────────────────────
+# Note: we deliberately do NOT clear the lease on exit. The lease is allowed
+# to expire naturally via its ${LEASE_DURATION}s timeout. This makes crash
+# behaviour (SIGKILL) identical to graceful-shutdown behaviour (SIGTERM) —
+# in both cases the standby takes over after the lease goes stale, which is
+# the only guarantee a real HA system can offer. Proactively releasing the
+# lease would create a lease vacancy window even during rolling upgrades,
+# which risks flap if the new holder isn't ready yet.
 cleanup() {
-  log "Caught termination signal."
-  if [ "$current_role" = "active" ]; then
-    clear_lease
-  fi
+  log "Caught termination signal. Letting lease expire naturally (~${LEASE_DURATION}s)."
   become_standby
   exit 0
 }
@@ -133,7 +149,7 @@ cleanup() {
 trap cleanup SIGTERM SIGINT EXIT
 
 # ── Main loop ────────────────────────────────────────────────────────────────
-log "Starting leader elector: pod=$POD_NAME uid=$POD_UID identity=$IDENTITY"
+log "Starting leader elector: pod=$POD_NAME uid=$POD_UID identity=$IDENTITY ordinal=$POD_ORDINAL acquisition_delay=${ACQUISITION_DELAY}s"
 log "Settings: duration=${LEASE_DURATION}s, renew=${RENEW_INTERVAL}s, retry=${RETRY_INTERVAL}s"
 
 mkdir -p "$(dirname "$ROLE_FILE")"
@@ -195,6 +211,26 @@ while true; do
   fi
 
   if [ "$lease_free" = "true" ]; then
+    # Priority delay: higher-ordinal pods try first; lower-ordinal pods wait.
+    # This ensures the standby (jenkins-1) beats the recreated active (jenkins-0).
+    if [ "$ACQUISITION_DELAY" -gt 0 ]; then
+      log "Priority delay: waiting ${ACQUISITION_DELAY}s before acquisition (ordinal=$POD_ORDINAL)..."
+      sleep "$ACQUISITION_DELAY"
+      # Re-read — a higher-priority pod may have already claimed the lease
+      lease_data="$(get_lease)" || { sleep "$RETRY_INTERVAL"; continue; }
+      IFS='|' read -r holder renew_time acquire_time <<< "$lease_data"
+      if [ -n "$holder" ] && [ "$holder" != "$IDENTITY" ]; then
+        renew_epoch="$(parse_time "$renew_time")"
+        now_epoch="$(epoch_seconds)"
+        age=$((now_epoch - renew_epoch))
+        if [ "$age" -le "$LEASE_DURATION" ]; then
+          log "Lease claimed by $holder during priority delay. Becoming standby."
+          become_standby
+          sleep "$RETRY_INTERVAL"
+          continue
+        fi
+      fi
+    fi
     if try_acquire; then
       # Verify with a re-read to close the race window
       sleep 0.5

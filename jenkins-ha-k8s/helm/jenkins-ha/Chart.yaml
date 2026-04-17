@@ -1,0 +1,15 @@
+apiVersion: v2
+name: jenkins-ha
+description: Active-passive Jenkins on Kubernetes with Lease-based leader election, RWX shared storage, and sidecar-driven failover.
+type: application
+version: 1.0.0
+appVersion: "lts"
+keywords:
+  - jenkins
+  - ci-cd
+  - high-availability
+  - leader-election
+  - statefulset
+home: https://github.com/harsh7raj/jenkins-ha-k8s
+maintainers:
+  - name: Jenkins HA Project
