@@ -9,6 +9,15 @@ spec:
   serviceName: jenkins-headless
   replicas: {{ .Values.replicaCount }}
   podManagementPolicy: {{ .Values.statefulset.podManagementPolicy }}
+  # OnDelete: do NOT auto-rotate pods on spec changes. Active-passive HA
+  # means the standby pod is intentionally NotReady (its readiness probe
+  # fails by design), so the default RollingUpdate strategy stalls waiting
+  # for the standby to become Ready. With OnDelete, `helm upgrade` only
+  # patches the StatefulSet spec — we explicitly delete pods in an
+  # HA-aware order (standby first, then force failover) to apply the
+  # change. See helm-upgrade-demo.sh.
+  updateStrategy:
+    type: OnDelete
   selector:
     matchLabels:
       {{- include "jenkins-ha.selectorLabels" . | nindent 6 }}

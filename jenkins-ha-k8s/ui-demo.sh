@@ -79,9 +79,14 @@ echo ""
 echo -e "${BOLD}  Expected setup (BEFORE you run this script):${NC}"
 echo ""
 echo -e "    ${GREEN}Terminal 1:${NC}  ${BOLD}make ui-port-forward${NC}"
-echo -e "                    (auto-reconnecting — keeps UI reachable)"
+echo -e "                    (endpoint-gated — keeps port 8080 DOWN until a"
+echo -e "                    Ready active pod exists, for a clean visual effect)"
 echo ""
-echo -e "    ${GREEN}Browser:${NC}    Open ${BOLD}http://localhost:8080${NC}"
+echo -e "    ${GREEN}Browser:${NC}    ${BOLD}Open a PRIVATE / INCOGNITO window${NC} at http://localhost:8080"
+echo -e "                    Or open DevTools → Network tab → check 'Disable cache'"
+echo -e "                    (This prevents Jenkins static assets from being"
+echo -e "                    served from cache during the crash window, which"
+echo -e "                    would otherwise make the UI look falsely 'up'.)"
 echo -e "                    Sign in → the Jenkins dashboard should be visible"
 echo ""
 echo -e "    ${GREEN}Terminal 2:${NC}  this script (${BOLD}make ui-demo${NC})"
@@ -193,20 +198,30 @@ divider "STEP 3 of 5 — 💥 Crash the Active Pod"
 
 explain "About to force-delete ${ACTIVE_POD}. What the audience will see:
 
-  • In the BROWSER: the page will stop loading / show an error. This is
-    expected — the pod serving the UI just died. The port-forward in
-    Terminal 1 will also error and auto-reconnect, but until a NEW
-    active pod exists, the Service has no endpoint to route to.
+  • In the BROWSER: ERR_CONNECTION_REFUSED on refresh. The page will
+    be fully unreachable for the entire failover window — no cached
+    HTML flickers, no half-loaded states. The endpoint-gated
+    port-forward keeps localhost:8080 closed until the NEW leader's
+    Jenkins container reports Ready.
 
-  • In this TERMINAL: we'll poll the Lease and wait for the standby
-    to take over. Natural lease expiry is ~${LEASE_DURATION}s + election
-    overhead (~2s) + Jenkins restart (~10-15s) → total 25-30s.
+  • In TERMINAL 1: you'll see
+        '⚠ Tunnel to ${ACTIVE_POD} dropped — UI is now DOWN...'
+        '⏳ No Ready active pod — waiting for leader to come up...'
+    until the new leader is Ready, at which point it prints
+        '✓ Leader Ready (jenkins-1) — opening tunnel on :8080'
+
+  • In this TERMINAL: we poll the Lease every 2s. Expected timeline:
+        +0s   pod deleted, Lease renewals stop
+        +15s  Lease expires, standby acquires it
+        +17s  guard script on new leader starts Jenkins
+        +25-30s  Jenkins readiness probe passes, tunnel re-opens
 
 Tell the audience BEFORE killing the pod:
-  'Watch the browser — the UI will go dark because the pod serving
-  it is about to die. After ~${LEASE_DURATION}s the standby will notice the
-  Lease has gone stale and take over. Then Jenkins starts on the
-  new pod, and the UI comes back — same data, same job history.'"
+  'Watch the browser. The UI is about to go completely dark — not
+  flickering, not partially loaded. After about ${LEASE_DURATION}s the standby
+  notices the Lease has gone stale and claims it. Jenkins then takes
+  another 10-15s to start up on the new leader. The moment Jenkins
+  is Ready, the browser works again — one clean down-to-up transition.'"
 
 press_enter
 
@@ -220,10 +235,19 @@ kubectl -n "$NS" delete pod "$ACTIVE_POD" --grace-period=0 --force 2>&1 || true
 KILL_TIME=$(date +%s)
 ok "Pod deleted. Lease renewals have stopped."
 
-browser_instructions "RIGHT NOW, switch to the browser and show the audience:
-  • The page is unresponsive / shows 'connection refused' or 'empty reply'
-  • The job Console Output froze mid-build
-  This is the expected downtime window — it will end in ~${LEASE_DURATION}-25s."
+browser_instructions "RIGHT NOW, switch to the browser and hit REFRESH.
+
+Expected: ${BOLD}ERR_CONNECTION_REFUSED${NC} (Chrome) /
+          ${BOLD}Unable to connect${NC} (Firefox) /
+          ${BOLD}Safari can't connect to the server${NC} (Safari).
+
+Show the audience this error page. Explain:
+  'The port-forward in Terminal 1 has detected that no active pod
+  exists, so it's keeping localhost:8080 fully closed. No cached
+  assets are being served, no partial page — the UI is genuinely
+  unreachable. This is the worst-case downtime window.'
+
+This window lasts ~${LEASE_DURATION}-25s total."
 
 echo ""
 log "Polling Lease every 2s until a new holder emerges..."
@@ -302,18 +326,26 @@ if [ "$READY_AT" -eq 0 ]; then
   warn "Pod not Ready within 60s — it may still be starting. Check the UI."
 fi
 
-browser_instructions "SWITCH BACK TO THE BROWSER and hit REFRESH (F5 / Cmd-R).
+browser_instructions "Check Terminal 1 — it should now show:
+  '✓ Leader Ready (${NEW_ACTIVE}) — opening tunnel on :8080'
 
-The page should load again — on the NEW pod. Show the audience:
-  • Jenkins dashboard returns
+SWITCH BACK TO THE BROWSER and hit REFRESH (F5 / Cmd-R).
+
+The UI transitions cleanly from ERR_CONNECTION_REFUSED → dashboard
+loaded. No in-between state. Show the audience:
+  • Jenkins dashboard returns — on a DIFFERENT pod
   • Navigate to ${BOLD}ha-demo-job${NC} in the job list — IT'S STILL THERE
   • Click the build — the config + previous build history SURVIVED
+    (the console output will show 'aborted' since the executor died
+    with the old pod — but the build record itself is intact)
   • Click ${BOLD}Build Now${NC} again to prove the new leader can run jobs
 
 TELL THE AUDIENCE:
-  'The pod serving this page has changed. But the PVC hasn't — the
-  job config, build history, user database, plugins, everything is
-  the same. Zero data loss, fully automatic, ~${READY_AT}s downtime.'"
+  'Single clean transition. No flicker, no cached artefacts — the
+  UI was genuinely unreachable for ~${READY_AT}s, then immediately
+  fully functional on a different pod. The job's config, its history,
+  the user database, plugins — everything is on the shared PVC and
+  completely intact. Zero data loss.'"
 
 press_enter
 

@@ -107,15 +107,38 @@ upgrade-test:
 	@./helm-upgrade-demo.sh
 
 # ── UI / Browser Demo ─────────────────────────────────────────────────────────
-# Auto-reconnecting port-forward — survives pod restarts during a live failover.
-# Use this instead of `make port-forward` when demonstrating in a browser.
+# Endpoint-gated port-forward — only opens the tunnel when the Service has
+# a Ready active endpoint. During failover (no active pod exists) we leave
+# localhost:8080 with no listener, so the browser gets a clean
+# ERR_CONNECTION_REFUSED instead of stale cached content. Once the new
+# leader's jenkins container is Ready, the tunnel opens and the browser
+# immediately works on refresh — one clean down→up visual transition.
 ui-port-forward:
-	@echo "Auto-reconnecting port-forward → http://localhost:8080"
-	@echo "(Press Ctrl+C to stop — reconnects automatically on pod changes)"
+	@echo "Endpoint-gated port-forward → http://localhost:8080"
+	@echo "(Press Ctrl+C to stop — stays DOWN until a Ready active pod exists)"
+	@echo ""
 	@while true; do \
-	  kubectl -n $(NS) port-forward svc/jenkins 8080:8080 2>/dev/null || true; \
-	  echo ""; echo "  ⚠ port-forward dropped (pod restart?) — reconnecting in 2s..."; \
-	  sleep 2; \
+	  ACTIVE=""; READY=""; \
+	  while [ "$$READY" != "true" ]; do \
+	    ACTIVE=$$(kubectl -n $(NS) get pod -l app=jenkins,jenkins-role=active \
+	      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null); \
+	    if [ -n "$$ACTIVE" ]; then \
+	      READY=$$(kubectl -n $(NS) get pod "$$ACTIVE" \
+	        -o jsonpath='{.status.containerStatuses[?(@.name=="jenkins")].ready}' 2>/dev/null); \
+	    else \
+	      READY=""; \
+	    fi; \
+	    if [ "$$READY" != "true" ]; then \
+	      printf "\r  ⏳ Waiting for Ready active pod (active=%-12s ready=%-5s)  " "$${ACTIVE:-<none>}" "$${READY:-<no>}"; \
+	      sleep 1; \
+	    fi; \
+	  done; \
+	  echo ""; \
+	  echo "  ✓ Leader Ready ($$ACTIVE) — opening tunnel on :8080"; \
+	  kubectl -n $(NS) port-forward pod/$$ACTIVE 8080:8080 2>/dev/null || true; \
+	  echo ""; \
+	  echo "  ⚠ Tunnel to $$ACTIVE dropped — UI is now DOWN until new leader is Ready"; \
+	  sleep 1; \
 	done
 
 ui-demo:

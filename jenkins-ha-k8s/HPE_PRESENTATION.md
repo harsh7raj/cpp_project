@@ -708,14 +708,20 @@ port-forward, one for the guided script).
 cd ~/Documents/Project__CP/jenkins-ha-k8s
 
 # ── TERMINAL 1 ───────────────────────────────────────────────────────
-# Auto-reconnecting port-forward. Unlike `make port-forward`, this one
-# survives pod restarts — when the pod serving the UI dies, the inner
-# kubectl command exits, the outer while-loop retries, and it picks up
-# the new leader once the Service endpoint updates.
+# Endpoint-gated port-forward. Critical difference from `make port-forward`:
+# this one keeps localhost:8080 FULLY DOWN while no Ready active pod exists.
+# When the pod serving the UI dies, the inner kubectl exits, the wrapper
+# waits until a pod with label jenkins-role=active AND containerStatuses[jenkins].ready=true
+# reappears, and only then reopens the tunnel. Result: the browser sees
+# one clean transition (UP → connection-refused → UP), not a flicker.
 make ui-port-forward
 # Leave this running for the entire demo.
 
 # ── BROWSER ──────────────────────────────────────────────────────────
+# IMPORTANT: open a PRIVATE / INCOGNITO window (or enable DevTools →
+# Network → "Disable cache"). Otherwise the browser may serve stale
+# Jenkins static assets from its HTTP cache during the crash window,
+# making the UI look falsely "up" while console output is frozen.
 # Open http://localhost:8080
 # Sign in with your admin account. The Jenkins dashboard should load.
 
